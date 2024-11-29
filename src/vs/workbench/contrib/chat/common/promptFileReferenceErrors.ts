@@ -6,11 +6,10 @@
 import { URI } from '../../../../base/common/uri.js';
 
 /**
- * Base resolve error class used when file reference resolution fails.
+ * Base prompt parsing error class.
  */
-abstract class ResolveError extends Error {
+export abstract class ParseError extends Error {
 	constructor(
-		public readonly uri: URI,
 		message?: string,
 		options?: ErrorOptions,
 	) {
@@ -37,9 +36,24 @@ abstract class ResolveError extends Error {
 }
 
 /**
+ * Base resolve error class used when file reference resolution fails.
+ */
+abstract class ResolveError extends ParseError {
+	constructor(
+		public readonly uri: URI,
+		message?: string,
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+	}
+}
+
+/**
  * Error that reflects the case when attempt to open target file fails.
  */
 export class FileOpenFailed extends ResolveError {
+	public readonly errorType = 'FileOpenError';
+
 	constructor(
 		uri: URI,
 		public readonly originalError: unknown,
@@ -66,6 +80,8 @@ export class FileOpenFailed extends ResolveError {
  * ```
  */
 export class RecursiveReference extends ResolveError {
+	public readonly errorType = 'RecursiveReferenceError';
+
 	constructor(
 		uri: URI,
 		public readonly recursivePath: string[],
@@ -113,7 +129,9 @@ export class RecursiveReference extends ResolveError {
  * Error that reflects the case when resource URI does not point to
  * a prompt snippet file, hence was not attempted to be resolved.
  */
-export class NonPromptSnippetFile extends ResolveError {
+export class NotPromptSnippetFile extends ResolveError {
+	public readonly errorType = 'NonPromptSnippetFileError';
+
 	constructor(
 		uri: URI,
 		message: string = '',

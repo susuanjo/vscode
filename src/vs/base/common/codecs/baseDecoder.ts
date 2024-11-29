@@ -308,11 +308,13 @@ export abstract class BaseDecoder<
 		return asyncDecoder[Symbol.asyncIterator]();
 	}
 
-	public override dispose(): void {
+	public override dispose(): this {
 		this.onStreamEnd();
 
 		this.stream.destroy();
 		this.removeAllListeners();
 		super.dispose();
+
+		return this;
 	}
 }

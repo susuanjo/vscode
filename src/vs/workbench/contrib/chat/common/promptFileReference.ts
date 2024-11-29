@@ -4,19 +4,24 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { URI } from '../../../../base/common/uri.js';
-import { Emitter } from '../../../../base/common/event.js';
+import { VSBuffer } from '../../../../base/common/buffer.js';
 import { extUri } from '../../../../base/common/resources.js';
+import { Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Location } from '../../../../editor/common/languages.js';
+import { ReadableStream } from '../../../../base/common/stream.js';
 import { ChatPromptCodec } from './codecs/chatPromptCodec/chatPromptCodec.js';
+import { FileReference } from './codecs/chatPromptCodec/tokens/fileReference.js';
+import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
-import { FileOpenFailed, NonPromptSnippetFile, RecursiveReference } from './promptFileReferenceErrors.js';
+import { ChatPromptDecoder, TChatPromptToken } from './codecs/chatPromptCodec/chatPromptDecoder.js';
+import { FileOpenFailed, NotPromptSnippetFile, RecursiveReference } from './promptFileReferenceErrors.js';
 import { FileChangesEvent, FileChangeType, IFileService, IFileStreamContent } from '../../../../platform/files/common/files.js';
 
 /**
  * Error conditions that may happen during the file reference resolution.
  */
-export type TErrorCondition = FileOpenFailed | RecursiveReference | NonPromptSnippetFile;
+export type TErrorCondition = FileOpenFailed | RecursiveReference | NotPromptSnippetFile;
 
 /**
  * File extension for the prompt snippet files.
@@ -27,6 +32,326 @@ const PROMP_SNIPPET_FILE_EXTENSION: string = '.prompt.md';
  * Configuration key for the prompt snippets feature.
  */
 const PROMPT_SNIPPETS_CONFIG_KEY: string = 'chat.experimental.prompt-snippets';
+
+/**
+ * TODO: @legomushroom
+ */
+export interface IPromptEntity {
+	readonly token: TChatPromptToken;
+
+	onUpdate(callback: () => void): void;
+}
+
+/**
+ * TODO: @legomushroom
+ */
+export type TPromptEntity = PromptFileRef;
+
+/**
+ * TODO: @legomushroom
+ */
+export abstract class PromptBase extends Disposable {
+	/**
+	 * Child references of the current one.
+	 */
+	private readonly children: TPromptEntity[] = [];
+
+	private readonly _onUpdate = this._register(new Emitter<void>());
+
+	public onUpdate(callback: () => void): void {
+		this._register(this._onUpdate.event(callback));
+	}
+
+	private _errorCondition?: TErrorCondition;
+	/**
+	 * If file reference resolution fails, this attribute will be set
+	 * to an error instance that describes the error condition.
+	 */
+	public get errorCondition(): TErrorCondition | undefined {
+		return this._errorCondition;
+	}
+
+	/**
+	 * Whether file reference resolution was attempted at least once.
+	 */
+	private _resolveAttempted: boolean = false;
+
+	/**
+	 * Whether file references resolution failed.
+	 * Set to `undefined` if the `resolve` method hasn't been ever called yet.
+	 */
+	public get resolveFailed(): boolean | undefined {
+		if (!this._resolveAttempted) {
+			return undefined;
+		}
+
+		return !!this._errorCondition;
+	}
+
+	/**
+	 * TODO: @legomushroom
+	 */
+	private currentDecoder?: ChatPromptDecoder;
+
+	constructor(
+		private readonly promptUri: URI | Location,
+		protected readonly seenReferences: string[] = [],
+		@IInstantiationService protected readonly instantiationService: IInstantiationService,
+		@IConfigurationService protected readonly configService: IConfigurationService,
+	) {
+		super();
+	}
+
+	/**
+	 * Associated URI of the prompt.
+	 */
+	public get uri(): URI {
+		return this.promptUri instanceof URI
+			? this.promptUri
+			: this.promptUri.uri;
+	}
+
+	/**
+	 * Get the parent folder of the file reference.
+	 */
+	public get parentFolder() {
+		return URI.joinPath(this.uri, '..');
+	}
+
+	/**
+	 * Get readable stream of prompt contents.
+	 *
+	 * @throws the {@link TErrorCondition} error if fails to obtain a readable
+	 * 		   stream for the prompt contents.
+	 */
+	protected abstract getContentsStream(): Promise<ReadableStream<VSBuffer>>;
+
+	/**
+	 * Dispose current child file references.
+	 */
+	private disposeChildren(): this {
+		for (const child of this.children) {
+			child.dispose();
+		}
+
+		this.children.length = 0;
+		this._onUpdate.fire();
+
+		return this;
+	}
+
+	/**
+	 * Parse tokens in prompt contents stream.
+	 */
+	public async parseStream(): Promise<this> {
+		if (!PromptBase.promptSnippetsEnabled(this.configService)) {
+			return this;
+		}
+
+		this._resolveAttempted = false;
+		this.currentDecoder?.dispose();
+		delete this.currentDecoder;
+		this.disposeChildren();
+
+		const seenReferences = [...this.seenReferences];
+		try {
+			// to prevent infinite file recursion, we keep track of all references in
+			// the current branch of the file reference tree and check if the current
+			// file reference has been already seen before
+			if (seenReferences.includes(this.uri.path)) {
+				seenReferences.push(this.uri.path);
+
+				throw new RecursiveReference(this.uri, seenReferences);
+			}
+
+			// we don't care if reading the file fails below, hence can add the path
+			// of the current reference to the `seenReferences` set immediately, -
+			// even if the file doesn't exist, we would never end up in the recursion
+			seenReferences.push(this.uri.path);
+
+			// TODO: @legomushroom - dispose the `stream`
+			const stream = await this.getContentsStream();
+			this.currentDecoder = ChatPromptCodec.decode(stream);
+
+			// TODO: @legomushroom - handle the `OnEnd` and `OnError` cases too?
+			this.currentDecoder.onData((token) => {
+				if (token instanceof FileReference) {
+					const promptEntity = this.instantiationService.createInstance(
+						PromptFileRef,
+						token,
+						this.parentFolder,
+						[...seenReferences],
+					);
+
+					promptEntity.onUpdate(this._onUpdate.fire.bind(this._onUpdate));
+					promptEntity.parseStream();
+
+					this.children.push(promptEntity);
+					this._onUpdate.fire();
+
+					return;
+				}
+
+				// TODO: @legomushroom - fire the error in more reliable way
+				throw new Error(`Unknown prompt token: ${token}`);
+			});
+
+		} catch (e) {
+			this._errorCondition = e as any; // TODO: @legomushroom - fix the error type
+		} finally {
+			this._resolveAttempted = true;
+		}
+
+		this._onUpdate.fire();
+
+		return this;
+	}
+
+	/**
+	 * Check if the prompt snippets feature is enabled.
+	 * @see {@link PROMPT_SNIPPETS_CONFIG_KEY}
+	 */
+	public static promptSnippetsEnabled(
+		configService: IConfigurationService,
+	): boolean {
+		const value = configService.getValue(PROMPT_SNIPPETS_CONFIG_KEY);
+
+		if (!value) {
+			return false;
+		}
+
+		if (typeof value === 'string') {
+			return value.trim().toLowerCase() === 'true';
+		}
+
+		return !!value;
+	}
+
+	/**
+	 * Flatten the current file reference tree into a single array.
+	 */
+	public flatten(): readonly TPromptEntity[] {
+		const result = [];
+
+		// TODO: @legomushroom
+		// // then add self to the result
+		// result.push(this);
+
+		// get flattened children references
+		for (const child of this.children) {
+			result.push(...child.flatten());
+		}
+
+		return result;
+	}
+
+	/**
+	 * Get list of all valid child references.
+	 */
+	public get validFileReferences(): readonly PromptFileRef[] {
+		return this.flatten()
+			// TODO: @legomushroom
+			// // skip the root reference itself (this variable)
+			// .slice(1)
+			// filter out unresolved references
+			.filter((reference) => {
+				if (reference.resolveFailed) {
+					return false;
+				}
+
+				// TODO: @legomushroom
+				return reference instanceof PromptFileRef;
+			});
+	}
+
+	/**
+	 * Get list of all valid child references as URIs.
+	 */
+	public get validFileReferenceUris(): readonly URI[] {
+		return this.validFileReferences
+			.map(child => child.uri);
+	}
+}
+
+/**
+ * TODO: @legomushroom
+ */
+export class FilePrompt extends PromptBase {
+	constructor(
+		uri: URI | Location,
+		seenReferences: string[] = [],
+		@IFileService private readonly fileService: IFileService,
+		@IInstantiationService initService: IInstantiationService,
+		@IConfigurationService configService: IConfigurationService,
+	) {
+		super(uri, seenReferences, initService, configService);
+
+		// make sure the variable is updated on file changes
+		// but only for the prompt snippet files
+		if (this.isPromptSnippetFile) {
+			this._register(
+				this.fileService.onDidFilesChange(this.onFilesChanged.bind(this)),
+			);
+		}
+	}
+
+	/**
+	 * @inheritdoc
+	 */
+	protected override async getContentsStream(): Promise<ReadableStream<VSBuffer>> {
+		// if URI doesn't point to a prompt snippet file, don't try to resolve it
+		if (this.uri.path.endsWith(PROMP_SNIPPET_FILE_EXTENSION) === false) {
+			throw new NotPromptSnippetFile(this.uri);
+		}
+
+		try {
+			const fileStream = await this.fileService.readFileStream(this.uri);
+
+			return fileStream.value;
+		} catch (error) {
+			throw new FileOpenFailed(this.uri, error);
+		}
+	}
+
+	/**
+	 * Check if the current reference points to a prompt snippet file.
+	 */
+	public get isPromptSnippetFile(): boolean {
+		return this.uri.path.endsWith(PROMP_SNIPPET_FILE_EXTENSION);
+	}
+
+	/**
+	 * Event handler for the `onDidFilesChange` event.
+	 */
+	private async onFilesChanged(event: FileChangesEvent) {
+		const fileChanged = event.contains(this.uri, FileChangeType.UPDATED);
+		const fileDeleted = event.contains(this.uri, FileChangeType.DELETED);
+		if (!fileChanged && !fileDeleted) {
+			return;
+		}
+
+		// if file is changed or deleted, re-resolve the file reference
+		// in the case when the file is deleted, this should result in
+		// failure to open the file, so the `errorCondition` field will
+		// be updated to an appropriate error instance and the `children`
+		// field will be cleared up
+		this.parseStream();
+	}
+}
+
+export class PromptFileRef extends FilePrompt implements IPromptEntity {
+	constructor(
+		public readonly token: FileReference,
+		parentFolder: URI,
+		seenReferences: string[] = [],
+		@IFileService fileService: IFileService,
+		@IInstantiationService initService: IInstantiationService,
+		@IConfigurationService configService: IConfigurationService,
+	) {
+		const fileUri = extUri.resolvePath(parentFolder, token.path);
+		super(fileUri, seenReferences, fileService, initService, configService);
+	}
+}
 
 /**
  * Represents a file reference in the chatbot prompt, e.g. `#file:./path/to/file.md`.
@@ -93,6 +418,26 @@ export class PromptFileReference extends Disposable {
 	}
 
 	/**
+	 * Check if the prompt snippets feature is enabled.
+	 * @see {@link PROMPT_SNIPPETS_CONFIG_KEY}
+	 */
+	public static promptSnippetsEnabled(
+		configService: IConfigurationService,
+	): boolean {
+		const value = configService.getValue(PROMPT_SNIPPETS_CONFIG_KEY);
+
+		if (!value) {
+			return false;
+		}
+
+		if (typeof value === 'string') {
+			return value.trim().toLowerCase() === 'true';
+		}
+
+		return !!value;
+	}
+
+	/**
 	 * Whether file reference resolution was attempted at least once.
 	 */
 	private _resolveAttempted: boolean = false;
@@ -121,26 +466,6 @@ export class PromptFileReference extends Disposable {
 		if (this.isPromptSnippetFile) {
 			this.addFilesystemListeners();
 		}
-	}
-
-	/**
-	 * Check if the prompt snippets feature is enabled.
-	 * @see {@link PROMPT_SNIPPETS_CONFIG_KEY}
-	 */
-	public static promptSnippetsEnabled(
-		configService: IConfigurationService,
-	): boolean {
-		const value = configService.getValue(PROMPT_SNIPPETS_CONFIG_KEY);
-
-		if (!value) {
-			return false;
-		}
-
-		if (typeof value === 'string') {
-			return value.trim().toLowerCase() === 'true';
-		}
-
-		return !!value;
 	}
 
 	/**
@@ -210,7 +535,7 @@ export class PromptFileReference extends Disposable {
 	private async getFileStream(): Promise<IFileStreamContent | null> {
 		// if URI doesn't point to a prompt snippet file, don't try to resolve it
 		if (this.uri.path.endsWith(PROMP_SNIPPET_FILE_EXTENSION) === false) {
-			this._errorCondition = new NonPromptSnippetFile(this.uri);
+			this._errorCondition = new NotPromptSnippetFile(this.uri);
 
 			return null;
 		}

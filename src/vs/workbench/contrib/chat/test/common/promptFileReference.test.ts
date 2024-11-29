@@ -13,13 +13,14 @@ import { IFileService } from '../../../../../platform/files/common/files.js';
 import { FileService } from '../../../../../platform/files/common/fileService.js';
 import { NullPolicyService } from '../../../../../platform/policy/common/policy.js';
 import { ILogService, NullLogService } from '../../../../../platform/log/common/log.js';
-import { PromptFileReference, TErrorCondition } from '../../common/promptFileReference.js';
+import { FilePrompt, PromptFileReference, TErrorCondition } from '../../common/promptFileReference.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../base/test/common/utils.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { ConfigurationService } from '../../../../../platform/configuration/common/configurationService.js';
 import { InMemoryFileSystemProvider } from '../../../../../platform/files/common/inMemoryFilesystemProvider.js';
-import { FileOpenFailed, RecursiveReference, NonPromptSnippetFile } from '../../common/promptFileReferenceErrors.js';
+import { FileOpenFailed, RecursiveReference, NotPromptSnippetFile } from '../../common/promptFileReferenceErrors.js';
 import { TestInstantiationService } from '../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
+import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 
 /**
  * Represents a file system node.
@@ -84,6 +85,7 @@ class TestPromptFileReference extends Disposable {
 		private readonly rootFileUri: URI,
 		private readonly expectedReferences: ExpectedReference[],
 		@IFileService private readonly fileService: IFileService,
+		@IInstantiationService private readonly initService: IInstantiationService,
 		@IConfigurationService private readonly configService: IConfigurationService,
 	) {
 		super();
@@ -109,14 +111,17 @@ class TestPromptFileReference extends Disposable {
 		);
 
 		// start resolving references for the specified root file
-		const rootReference = this._register(new PromptFileReference(
+		const rootReference = this._register(new FilePrompt(
 			this.rootFileUri,
+			[],
 			this.fileService,
+			this.initService,
 			this.configService,
 		));
 
 		// resolve the root file reference including all nested references
-		const resolvedReferences = (await rootReference.resolve(true))
+		const resolvedReferences = (await rootReference.parseStream())
+			// TODO: @legomushroom - wait until received all entities before flattening
 			.flatten();
 
 		assert.strictEqual(
@@ -296,7 +301,7 @@ suite('PromptFileReference (Unix)', function () {
 				)),
 				testDisposables.add(new ExpectedReference(
 					URI.joinPath(rootUri, './folder1/some-other-folder/file.txt'),
-					new NonPromptSnippetFile(
+					new NotPromptSnippetFile(
 						URI.joinPath(rootUri, './folder1/some-other-folder/file.txt'),
 						'Ughh oh!',
 					),
@@ -314,7 +319,7 @@ suite('PromptFileReference (Unix)', function () {
 				)),
 				testDisposables.add(new ExpectedReference(
 					URI.joinPath(rootUri, './folder1/some-other-folder/some-non-prompt-file.md'),
-					new NonPromptSnippetFile(
+					new NotPromptSnippetFile(
 						URI.joinPath(rootUri, './folder1/some-other-folder/some-non-prompt-file.md'),
 						'Oh no!',
 					),
@@ -457,7 +462,7 @@ suite('PromptFileReference (Unix)', function () {
 				)),
 				testDisposables.add(new ExpectedReference(
 					URI.joinPath(rootUri, './file1.md'),
-					new NonPromptSnippetFile(
+					new NotPromptSnippetFile(
 						URI.joinPath(rootUri, './file1.md'),
 						'Uggh oh!',
 					),
